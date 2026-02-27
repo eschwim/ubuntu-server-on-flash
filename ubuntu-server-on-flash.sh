@@ -113,11 +113,51 @@ on_error() {
 }
 
 # =============================================================================
+# Step 1: Preflight checks & host dependencies
+# =============================================================================
+preflight() {
+    step 1 "Preflight checks and host dependencies"
+
+    [[ $EUID -eq 0 ]] || die "This script must be run as root."
+
+    # Safety confirmation
+    echo ""
+    echo -e "${RED}╔════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  WARNING: ALL DATA ON ${TARGET} WILL BE PERMANENTLY DESTROYED     ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINT "$TARGET" 2>/dev/null || true
+    echo ""
+    echo -e "  Release  : ${BOLD}$RELEASE${NC}"
+    echo -e "  Hostname : ${BOLD}$HOSTNAME_TARGET${NC}"
+    echo -e "  User     : ${BOLD}$DEFAULT_USER${NC}"
+    echo -e "  Swap     : ${BOLD}$(${ENABLE_SWAP} && echo 'zram (enabled)' || echo 'DISABLED')${NC}"
+    echo ""
+    read -rp "Type YES in all caps to continue: " CONFIRM
+    [[ "$CONFIRM" == "YES" ]] || die "Aborted by user."
+
+    # Install host dependencies
+    local DEPS=(debootstrap f2fs-tools dosfstools gdisk)
+    local MISSING=()
+    for pkg in "${DEPS[@]}"; do
+        dpkg -s "$pkg" &>/dev/null || MISSING+=("$pkg")
+    done
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+        info "Installing host packages: ${MISSING[*]}"
+        apt-get update -qq
+        apt-get install -y -qq "${MISSING[@]}"
+    fi
+    ok "Host dependencies ready."
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
     parse_args "$@"
     trap 'on_error $LINENO' ERR
+
+    preflight
 }
 
 main "$@"
