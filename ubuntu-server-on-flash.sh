@@ -174,6 +174,25 @@ partition_drive() {
 }
 
 # =============================================================================
+# Step 3: Create filesystems
+# =============================================================================
+create_filesystems() {
+    step 3 "Creating filesystems"
+
+    info "Formatting EFI (FAT32)..."
+    mkfs.vfat -F 32 -n EFI "$PART_EFI"
+
+    info "Formatting root (F2FS with compression feature)..."
+    mkfs.f2fs -f \
+        -O extra_attr,inode_checksum,sb_checksum,compression \
+        -C utf8 \
+        -l rootfs \
+        "$PART_ROOT"
+
+    ok "Filesystems created."
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -182,6 +201,7 @@ main() {
 
     preflight
     partition_drive
+    create_filesystems
 }
 
 main "$@"
