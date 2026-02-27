@@ -151,6 +151,29 @@ preflight() {
 }
 
 # =============================================================================
+# Step 2: Partition the target drive
+# =============================================================================
+partition_drive() {
+    step 2 "Partitioning $TARGET (GPT: ${EFI_SIZE} EFI + F2FS root)"
+
+    # Unmount anything currently on the target
+    for mp in $(findmnt -rn -o TARGET -S "${TARGET}"* 2>/dev/null || true); do
+        umount -f "$mp" 2>/dev/null || true
+    done
+
+    wipefs -af "$TARGET"
+    sgdisk --zap-all "$TARGET"
+    sgdisk -n "1:0:+${EFI_SIZE}" -t 1:ef00 -c 1:"EFI"    "$TARGET"
+    sgdisk -n 2:0:0              -t 2:8300 -c 2:"rootfs"  "$TARGET"
+    partprobe "$TARGET"
+    sleep 2
+
+    [[ -b "$PART_EFI"  ]] || die "EFI partition $PART_EFI not found."
+    [[ -b "$PART_ROOT" ]] || die "Root partition $PART_ROOT not found."
+    ok "Partitions created: EFI=$PART_EFI  Root=$PART_ROOT"
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -158,6 +181,7 @@ main() {
     trap 'on_error $LINENO' ERR
 
     preflight
+    partition_drive
 }
 
 main "$@"
