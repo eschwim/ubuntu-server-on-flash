@@ -550,6 +550,157 @@ EOF
 }
 
 # =============================================================================
+# Step 9: Install verification script onto target
+# =============================================================================
+install_verify_script() {
+    step 9 "Installing post-boot verification script"
+
+    # We need to know the swap setting inside the script
+    local SWAP_CHECK_BLOCK=""
+    if $ENABLE_SWAP; then
+        SWAP_CHECK_BLOCK='
+echo ""
+echo "Swap:"
+if swapon --show --noheadings 2>/dev/null | grep -q zram; then
+    SIZE=$(swapon --show --noheadings | awk "/zram/{print \$3}")
+    check "zram swap active ($SIZE)" "pass"
+else
+    check "zram swap active" "fail"
+fi
+
+DISK_SWAP=$(swapon --show --noheadings 2>/dev/null | grep -v zram || true)
+if [[ -z "$DISK_SWAP" ]]; then
+    check "No disk-based swap" "pass"
+else
+    check "No disk-based swap (FOUND: $DISK_SWAP)" "fail"
+fi'
+    else
+        SWAP_CHECK_BLOCK='
+echo ""
+echo "Swap:"
+if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    check "Swap disabled (but swap IS active — unexpected)" "fail"
+else
+    check "Swap disabled (none active)" "pass"
+fi'
+    fi
+
+    cat > "$MOUNTPOINT/usr/local/sbin/verify-usb-setup.sh" << VERIFYEOF
+#!/usr/bin/env bash
+# =============================================================================
+# verify-usb-setup.sh — Check that all write-endurance optimizations are active
+# Run: sudo /usr/local/sbin/verify-usb-setup.sh
+# =============================================================================
+set -euo pipefail
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+PASS=0; FAIL=0; WARN=0
+
+check() {
+    local desc="\$1" result="\$2"
+    if [[ "\$result" == "pass" ]]; then
+        echo -e "  \${GREEN}✓\${NC} \$desc"; ((PASS++))
+    elif [[ "\$result" == "warn" ]]; then
+        echo -e "  \${YELLOW}!\${NC} \$desc"; ((WARN++))
+    else
+        echo -e "  \${RED}✗\${NC} \$desc"; ((FAIL++))
+    fi
+}
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo " USB Flash Drive — Write Endurance Verification"
+echo "═══════════════════════════════════════════════════"
+
+# ── Filesystem ─────────────────────────────────────────────────────────────
+echo ""
+echo "Filesystem:"
+ROOT_OPTS=\$(findmnt -n -o OPTIONS /)
+
+[[ "\$ROOT_OPTS" == *f2fs* ]]                         && r="pass" || r="fail"; check "Root is F2FS" "\$r"
+[[ "\$ROOT_OPTS" == *compress_algorithm=zstd* ]]      && r="pass" || r="fail"; check "zstd compression active" "\$r"
+[[ "\$ROOT_OPTS" == *noatime* ]]                      && r="pass" || r="fail"; check "noatime set" "\$r"
+[[ "\$ROOT_OPTS" == *lazytime* ]]                     && r="pass" || r="fail"; check "lazytime set" "\$r"
+
+# ── tmpfs ──────────────────────────────────────────────────────────────────
+echo ""
+echo "Volatile directories (tmpfs):"
+for dir in /tmp /var/log /var/spool /var/cache /var/tmp; do
+    fs=\$(findmnt -n -o FSTYPE "\$dir" 2>/dev/null || echo "none")
+    [[ "\$fs" == "tmpfs" ]] && check "\$dir → tmpfs" "pass" \
+                            || check "\$dir → tmpfs (got: \$fs)" "fail"
+done
+
+# ── Swap ───────────────────────────────────────────────────────────────────
+${SWAP_CHECK_BLOCK}
+
+# ── Journald ──────────────────────────────────────────────────────────────
+echo ""
+echo "Journald:"
+if [[ -d /run/log/journal ]] && [[ ! -d /var/log/journal ]]; then
+    check "Storage is volatile (RAM)" "pass"
+elif [[ -d /var/log/journal ]]; then
+    check "Storage is volatile (WARNING: /var/log/journal exists)" "warn"
+else
+    check "Storage is volatile" "pass"
+fi
+
+# ── Kernel tuning ─────────────────────────────────────────────────────────
+echo ""
+echo "Kernel tuning:"
+WB=\$(cat /proc/sys/vm/dirty_writeback_centisecs 2>/dev/null || echo 0)
+[[ "\$WB" -ge 6000 ]] && check "dirty_writeback ≥ 60s (\${WB}cs)" "pass" \
+                       || check "dirty_writeback ≥ 60s (got: \${WB}cs)" "fail"
+
+DR=\$(cat /proc/sys/vm/dirty_ratio 2>/dev/null || echo 0)
+[[ "\$DR" -ge 30 ]] && check "dirty_ratio ≥ 30% (\${DR}%)" "pass" \
+                     || check "dirty_ratio ≥ 30% (got: \${DR}%)" "fail"
+
+SW=\$(cat /proc/sys/vm/swappiness 2>/dev/null || echo 0)
+[[ "\$SW" -ge 100 ]] && check "swappiness = 100 (\$SW)" "pass" \
+                      || check "swappiness ≥ 100 (got: \$SW)" "warn"
+
+# ── F2FS tuning ──────────────────────────────────────────────────────────
+echo ""
+echo "F2FS tuning:"
+DEV=\$(findmnt -n -o SOURCE / | sed 's|/dev/||')
+F2FS_DIR="/sys/fs/f2fs/\$DEV"
+if [[ -d "\$F2FS_DIR" ]]; then
+    CP=\$(cat "\$F2FS_DIR/cp_interval" 2>/dev/null || echo "0")
+    [[ "\$CP" -ge 60 ]] && check "cp_interval ≥ 60s (\${CP}s)" "pass" \
+                        || check "cp_interval ≥ 60s (got: \${CP}s)" "warn"
+else
+    check "F2FS sysfs directory found" "fail"
+fi
+
+# ── Masked services ──────────────────────────────────────────────────────
+echo ""
+echo "Masked services:"
+for svc in apt-daily.timer apt-daily-upgrade.timer fstrim.timer systemd-coredump.socket; do
+    STATE=\$(systemctl is-enabled "\$svc" 2>/dev/null || echo "not-found")
+    if [[ "\$STATE" == "masked" ]]; then
+        check "\$svc" "pass"
+    elif [[ "\$STATE" == "not-found" ]]; then
+        check "\$svc (not installed — OK)" "pass"
+    else
+        check "\$svc (state: \$STATE)" "fail"
+    fi
+done
+
+# ── Summary ──────────────────────────────────────────────────────────────
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo -e " Results: \${GREEN}\$PASS passed\${NC}, \${YELLOW}\$WARN warnings\${NC}, \${RED}\$FAIL failed\${NC}"
+echo "═══════════════════════════════════════════════════"
+echo ""
+[[ \$FAIL -eq 0 ]] && exit 0 || exit 1
+VERIFYEOF
+
+    chmod +x "$MOUNTPOINT/usr/local/sbin/verify-usb-setup.sh"
+    ok "Verification script installed at /usr/local/sbin/verify-usb-setup.sh"
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -564,6 +715,7 @@ main() {
     prepare_chroot
     chroot_configure_system
     apply_write_reduction
+    install_verify_script
 }
 
 main "$@"
