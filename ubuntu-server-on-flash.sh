@@ -211,6 +211,17 @@ mount_target() {
 }
 
 # =============================================================================
+# Step 5: Debootstrap
+# =============================================================================
+run_debootstrap() {
+    step 5 "Bootstrapping Ubuntu $RELEASE (this takes several minutes)"
+
+    debootstrap --arch=amd64 "$RELEASE" "$MOUNTPOINT" "$MIRROR"
+
+    ok "Base system installed with compression."
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -221,6 +232,7 @@ main() {
     partition_drive
     create_filesystems
     mount_target
+    run_debootstrap
 }
 
 main "$@"
