@@ -222,6 +222,193 @@ run_debootstrap() {
 }
 
 # =============================================================================
+# Step 6: Prepare chroot bind mounts
+# =============================================================================
+prepare_chroot() {
+    step 6 "Preparing chroot environment"
+
+    mount --bind /dev     "$MOUNTPOINT/dev"
+    mount --bind /dev/pts "$MOUNTPOINT/dev/pts"
+    mount --bind /proc    "$MOUNTPOINT/proc"
+    mount --bind /sys     "$MOUNTPOINT/sys"
+    mount --bind /run     "$MOUNTPOINT/run"
+    cp -L /etc/resolv.conf "$MOUNTPOINT/etc/resolv.conf"
+
+    ok "Chroot bind mounts ready."
+}
+
+# Helper: run a command inside the chroot with our env vars
+run_in_chroot() {
+    chroot "$MOUNTPOINT" /bin/bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+        $1
+    "
+}
+
+# =============================================================================
+# Step 7: Configure system inside chroot
+# =============================================================================
+chroot_configure_system() {
+    step 7 "Configuring system inside chroot"
+
+    # ── APT sources ─────────────────────────────────────────────────────────
+    chroot_info "Configuring APT sources for $RELEASE..."
+
+    cat > "$MOUNTPOINT/etc/apt/sources.list.d/ubuntu.sources" << EOF
+Types: deb
+URIs: $MIRROR
+Suites: ${RELEASE} ${RELEASE}-updates ${RELEASE}-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+    rm -f "$MOUNTPOINT/etc/apt/sources.list"
+
+    run_in_chroot "apt-get update -qq"
+    chroot_ok "APT sources configured."
+
+    # ── Pre-seed debconf ────────────────────────────────────────────────────
+    run_in_chroot "echo 'man-db man-db/auto-update boolean false' | debconf-set-selections"
+
+    # ── Install packages ────────────────────────────────────────────────────
+    chroot_info "Installing kernel, bootloader, and essential packages..."
+
+    local PACKAGES=(
+        linux-generic
+        grub-efi-amd64
+        grub-efi-amd64-signed
+        shim-signed
+        f2fs-tools
+        systemd-sysv
+        sudo
+        openssh-server
+        systemd-resolved
+        nano
+        less
+        bash-completion
+        ubuntu-minimal
+    )
+    if $ENABLE_SWAP; then
+        PACKAGES+=(zram-tools)
+    fi
+
+    run_in_chroot "apt-get install -y -qq ${PACKAGES[*]}"
+    chroot_ok "Packages installed."
+
+    # ── Locale & timezone ───────────────────────────────────────────────────
+    chroot_info "Setting locale and timezone..."
+    run_in_chroot "
+        echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
+        locale-gen
+        echo 'LANG=en_US.UTF-8' > /etc/default/locale
+        ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+        dpkg-reconfigure -f noninteractive tzdata
+    "
+    chroot_ok "Locale: en_US.UTF-8, Timezone: UTC"
+
+    # ── Hostname ────────────────────────────────────────────────────────────
+    chroot_info "Setting hostname to $HOSTNAME_TARGET..."
+    echo "$HOSTNAME_TARGET" > "$MOUNTPOINT/etc/hostname"
+    cat > "$MOUNTPOINT/etc/hosts" << EOF
+127.0.0.1   localhost
+127.0.1.1   ${HOSTNAME_TARGET}
+
+::1         localhost ip6-localhost ip6-loopback
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+EOF
+
+    # ── Create user ─────────────────────────────────────────────────────────
+    chroot_info "Creating user '$DEFAULT_USER'..."
+    run_in_chroot "
+        useradd -m -s /bin/bash -G sudo '$DEFAULT_USER'
+        echo '${DEFAULT_USER}:${DEFAULT_PASS}' | chpasswd
+        chage -d 0 '$DEFAULT_USER'
+    "
+    chroot_ok "User '$DEFAULT_USER' created (password change forced on first login)."
+
+    # ── fstab ───────────────────────────────────────────────────────────────
+    chroot_info "Writing /etc/fstab..."
+
+    local ROOT_UUID EFI_UUID
+    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    EFI_UUID=$(blkid -s UUID -o value "$PART_EFI")
+
+    cat > "$MOUNTPOINT/etc/fstab" << EOF
+# =============================================================================
+# USB Flash Drive fstab — F2FS compressed root + tmpfs volatile dirs
+# =============================================================================
+
+# Root: F2FS with zstd:6 compression on all files
+UUID=${ROOT_UUID}   /           f2fs    compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,atgc,lazytime,noatime  0  0
+
+# EFI System Partition
+UUID=${EFI_UUID}    /boot/efi   vfat    umask=0077  0  1
+
+# ── Volatile directories on tmpfs (never touch flash) ────────────────────────
+tmpfs   /tmp          tmpfs   nosuid,nodev,size=50%                 0  0
+tmpfs   /var/tmp      tmpfs   nosuid,nodev,size=200M                0  0
+tmpfs   /var/log      tmpfs   nosuid,nodev,noexec,size=200M         0  0
+tmpfs   /var/spool    tmpfs   nosuid,nodev,noexec,size=100M         0  0
+tmpfs   /var/cache    tmpfs   nosuid,nodev,noexec,size=500M         0  0
+EOF
+    chroot_ok "fstab written."
+
+    # ── Networking ──────────────────────────────────────────────────────────
+    chroot_info "Configuring systemd-networkd..."
+    mkdir -p "$MOUNTPOINT/etc/systemd/network"
+    cat > "$MOUNTPOINT/etc/systemd/network/80-wired-dhcp.network" << 'EOF'
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+RouteMetric=100
+EOF
+    run_in_chroot "
+        systemctl enable systemd-networkd
+        systemctl enable systemd-resolved
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+    "
+    chroot_ok "Networking: DHCP on all wired interfaces."
+
+    # ── GRUB ────────────────────────────────────────────────────────────────
+    chroot_info "Installing GRUB (UEFI, removable)..."
+    cat > "$MOUNTPOINT/etc/default/grub" << 'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_TIMEOUT_STYLE=menu
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX=""
+GRUB_TERMINAL=console
+GRUB_DISABLE_OS_PROBER=true
+EOF
+    run_in_chroot "
+        grub-install \
+            --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --bootloader-id=ubuntu \
+            --removable \
+            --no-nvram
+        update-grub
+    "
+    chroot_ok "GRUB installed (removable EFI — portable across UEFI machines)."
+
+    # ── initramfs ───────────────────────────────────────────────────────────
+    chroot_info "Updating initramfs with F2FS support..."
+    run_in_chroot "
+        grep -qxF 'f2fs' /etc/initramfs-tools/modules 2>/dev/null || \
+            echo 'f2fs' >> /etc/initramfs-tools/modules
+        update-initramfs -u -k all
+    "
+    chroot_ok "initramfs updated."
+
+    ok "System configuration complete."
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -233,6 +420,8 @@ main() {
     create_filesystems
     mount_target
     run_debootstrap
+    prepare_chroot
+    chroot_configure_system
 }
 
 main "$@"
