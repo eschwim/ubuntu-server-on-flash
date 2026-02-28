@@ -193,6 +193,24 @@ create_filesystems() {
 }
 
 # =============================================================================
+# Step 4: Mount with compression active
+# =============================================================================
+mount_target() {
+    step 4 "Mounting F2FS with zstd:6 compression"
+
+    cleanup_mounts 2>/dev/null
+    mkdir -p "$MOUNTPOINT"
+
+    local F2FS_OPTS="compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,atgc,lazytime,noatime"
+    mount -t f2fs -o "$F2FS_OPTS" "$PART_ROOT" "$MOUNTPOINT"
+
+    mkdir -p "$MOUNTPOINT/boot/efi"
+    mount -t vfat "$PART_EFI" "$MOUNTPOINT/boot/efi"
+
+    ok "Mounted — ALL writes from here on are compressed on disk."
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -202,6 +220,7 @@ main() {
     preflight
     partition_drive
     create_filesystems
+    mount_target
 }
 
 main "$@"
