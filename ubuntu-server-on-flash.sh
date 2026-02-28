@@ -409,6 +409,147 @@ EOF
 }
 
 # =============================================================================
+# Step 8: Apply write-endurance optimizations
+# =============================================================================
+apply_write_reduction() {
+    step 8 "Applying write-endurance optimizations"
+
+    # ── 8a. Journald → volatile ────────────────────────────────────────────
+    chroot_info "journald → volatile (RAM only, 64M cap)..."
+    mkdir -p "$MOUNTPOINT/etc/systemd/journald.conf.d"
+    cat > "$MOUNTPOINT/etc/systemd/journald.conf.d/volatile.conf" << 'EOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=64M
+RuntimeMaxFileSize=8M
+ForwardToSyslog=no
+Compress=yes
+EOF
+
+    # ── 8b. sysctl tuning ──────────────────────────────────────────────────
+    chroot_info "sysctl: writeback=60s, dirty_ratio=40%..."
+    cat > "$MOUNTPOINT/etc/sysctl.d/99-usb-flash-endurance.conf" << EOF
+# ── Write coalescing ─────────────────────────────────────────────────────────
+vm.dirty_writeback_centisecs = 6000
+vm.dirty_expire_centisecs = 6000
+vm.dirty_ratio = 40
+vm.dirty_background_ratio = 5
+
+# ── Swap / cache behavior ────────────────────────────────────────────────────
+$($ENABLE_SWAP && echo 'vm.swappiness = 100' || echo '# vm.swappiness left at default (swap disabled)')
+vm.vfs_cache_pressure = 50
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+fs.inotify.max_user_watches = 8192
+EOF
+
+    # ── 8c. zram swap (conditional) ────────────────────────────────────────
+    if $ENABLE_SWAP; then
+        chroot_info "zram swap: zstd, 50% of RAM, priority 100..."
+        cat > "$MOUNTPOINT/etc/default/zramswap" << 'EOF'
+ALGO=zstd
+PERCENT=50
+PRIORITY=100
+EOF
+        run_in_chroot "systemctl enable zramswap.service 2>/dev/null || true"
+    else
+        chroot_info "Swap disabled by --no-swap flag."
+        # If zram-tools somehow got installed, make sure it stays off
+        run_in_chroot "systemctl disable zramswap.service 2>/dev/null || true"
+        run_in_chroot "systemctl mask zramswap.service 2>/dev/null || true"
+    fi
+
+    # ── 8d. Disable write-heavy timers ─────────────────────────────────────
+    chroot_info "Masking write-heavy timers..."
+    local MASK_UNITS=(
+        apt-daily.timer
+        apt-daily-upgrade.timer
+        fstrim.timer
+        man-db.timer
+        e2scrub_all.timer
+        e2scrub_reap.service
+    )
+    for unit in "${MASK_UNITS[@]}"; do
+        run_in_chroot "systemctl mask '$unit' 2>/dev/null || true"
+    done
+    chroot_ok "Masked: ${MASK_UNITS[*]}"
+
+    # ── 8e. Disable core dumps ─────────────────────────────────────────────
+    chroot_info "Disabling core dumps..."
+    cat > "$MOUNTPOINT/etc/sysctl.d/99-no-coredump.conf" << 'EOF'
+kernel.core_pattern=|/bin/false
+fs.suid_dumpable = 0
+EOF
+    mkdir -p "$MOUNTPOINT/etc/security/limits.d"
+    cat > "$MOUNTPOINT/etc/security/limits.d/no-coredump.conf" << 'EOF'
+*    hard    core    0
+*    soft    core    0
+EOF
+    run_in_chroot "systemctl mask systemd-coredump.socket 2>/dev/null || true"
+
+    # ── 8f. F2FS runtime tuning service ────────────────────────────────────
+    chroot_info "Creating f2fs-tune.service (cp_interval=60s, iostat off)..."
+    cat > "$MOUNTPOINT/etc/systemd/system/f2fs-tune.service" << 'EOF'
+[Unit]
+Description=Tune F2FS for USB flash write endurance
+After=local-fs.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+    DEV=$(findmnt -n -o SOURCE / | sed "s|/dev/||"); \
+    F2FS_DIR="/sys/fs/f2fs/$DEV"; \
+    if [ -d "$F2FS_DIR" ]; then \
+        echo 60 > "$F2FS_DIR/cp_interval" 2>/dev/null || true; \
+        echo 0  > "$F2FS_DIR/iostat_enable" 2>/dev/null || true; \
+        echo "F2FS tuned: cp_interval=60, iostat=off ($DEV)"; \
+    else \
+        echo "Warning: F2FS sysfs dir not found for $DEV"; \
+    fi'
+
+[Install]
+WantedBy=local-fs.target
+EOF
+    run_in_chroot "systemctl enable f2fs-tune.service 2>/dev/null || true"
+
+    # ── 8g. Slow down tmpfiles-clean ───────────────────────────────────────
+    chroot_info "tmpfiles-clean interval → 1h..."
+    mkdir -p "$MOUNTPOINT/etc/systemd/system/systemd-tmpfiles-clean.timer.d"
+    cat > "$MOUNTPOINT/etc/systemd/system/systemd-tmpfiles-clean.timer.d/endurance.conf" << 'EOF'
+[Timer]
+OnUnitActiveSec=1h
+EOF
+
+    # ── 8h. SSH host keys — pre-generate ───────────────────────────────────
+    chroot_info "Pre-generating SSH host keys..."
+    run_in_chroot "
+        ssh-keygen -A 2>/dev/null || true
+        systemctl mask ssh-host-keys-generate.service 2>/dev/null || true
+    "
+
+    # ── 8i. Disable rsyslog if present ─────────────────────────────────────
+    run_in_chroot "
+        if dpkg -s rsyslog &>/dev/null; then
+            systemctl disable rsyslog.service 2>/dev/null || true
+            systemctl mask rsyslog.service 2>/dev/null || true
+        fi
+    "
+
+    # ── 8j. Disable all APT periodic tasks ─────────────────────────────────
+    chroot_info "APT periodic tasks → all disabled..."
+    cat > "$MOUNTPOINT/etc/apt/apt.conf.d/99-no-periodic.conf" << 'EOF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+
+    ok "All write-endurance optimizations applied."
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -422,6 +563,7 @@ main() {
     run_debootstrap
     prepare_chroot
     chroot_configure_system
+    apply_write_reduction
 }
 
 main "$@"
