@@ -336,7 +336,7 @@ EOF
 
     cat > "$MOUNTPOINT/etc/fstab" << EOF
 # =============================================================================
-# USB Flash Drive fstab — F2FS compressed root + tmpfs volatile dirs
+# USB Flash Drive fstab — F2FS compressed root + zram volatile dirs
 # =============================================================================
 
 # Root: F2FS with zstd:6 compression on all files
@@ -345,12 +345,12 @@ UUID=${ROOT_UUID}   /           f2fs    compress_algorithm=zstd:6,compress_exten
 # EFI System Partition
 UUID=${EFI_UUID}    /boot/efi   vfat    umask=0077  0  1
 
-# ── Volatile directories on tmpfs (never touch flash) ────────────────────────
-tmpfs   /tmp          tmpfs   nosuid,nodev,size=50%                 0  0
-tmpfs   /var/tmp      tmpfs   nosuid,nodev,size=200M                0  0
-tmpfs   /var/log      tmpfs   nosuid,nodev,noexec,size=200M         0  0
-tmpfs   /var/spool    tmpfs   nosuid,nodev,noexec,size=100M         0  0
-tmpfs   /var/cache    tmpfs   nosuid,nodev,noexec,size=500M         0  0
+# ── Volatile directories — zram (lzo) backed, formatted at boot via udev ──────
+/dev/zram0  /tmp        ext4  nosuid,nodev,noatime          0  0
+/dev/zram1  /var/tmp    ext4  nosuid,nodev,noatime          0  0
+/dev/zram2  /var/log    ext4  nosuid,nodev,noexec,noatime   0  0
+/dev/zram3  /var/spool  ext4  nosuid,nodev,noexec,noatime   0  0
+/dev/zram4  /var/cache  ext4  nosuid,nodev,noexec,noatime   0  0
 EOF
     chroot_ok "fstab written."
 
@@ -546,6 +546,27 @@ APT::Periodic::AutocleanInterval "0";
 APT::Periodic::Unattended-Upgrade "0";
 EOF
 
+    # ── 8k. zram-backed volatile directories ───────────────────────────────
+    chroot_info "Setting up zram volatile directories (lzo, no-journal ext4, udev+fstab)..."
+
+    # Load zram at boot with 5 pre-allocated devices (zram0–4).
+    # If swap is enabled, zramswap will hot-add zram5 via zramctl --find.
+    echo 'zram' > "$MOUNTPOINT/etc/modules-load.d/zram-volatile.conf"
+    cat > "$MOUNTPOINT/etc/modprobe.d/zram-volatile.conf" << 'EOF'
+options zram num_devices=5
+EOF
+
+    # One rule per device: set lzo compression + disksize, then format.
+    # RUN+= is synchronous, so the device is ready before systemd mounts fstab.
+    cat > "$MOUNTPOINT/etc/udev/rules.d/99-zram-volatile.rules" << 'EOF'
+KERNEL=="zram0", SUBSYSTEM=="block", DRIVER=="", ACTION=="add", ATTR{initstate}=="0", ATTR{comp_algorithm}="lzo", ATTR{disksize}="2G",   RUN+="/sbin/mkfs.ext4 -q -O ^has_journal -L $name $env{DEVNAME}"
+KERNEL=="zram1", SUBSYSTEM=="block", DRIVER=="", ACTION=="add", ATTR{initstate}=="0", ATTR{comp_algorithm}="lzo", ATTR{disksize}="500M", RUN+="/sbin/mkfs.ext4 -q -O ^has_journal -L $name $env{DEVNAME}"
+KERNEL=="zram2", SUBSYSTEM=="block", DRIVER=="", ACTION=="add", ATTR{initstate}=="0", ATTR{comp_algorithm}="lzo", ATTR{disksize}="500M", RUN+="/sbin/mkfs.ext4 -q -O ^has_journal -L $name $env{DEVNAME}"
+KERNEL=="zram3", SUBSYSTEM=="block", DRIVER=="", ACTION=="add", ATTR{initstate}=="0", ATTR{comp_algorithm}="lzo", ATTR{disksize}="256M", RUN+="/sbin/mkfs.ext4 -q -O ^has_journal -L $name $env{DEVNAME}"
+KERNEL=="zram4", SUBSYSTEM=="block", DRIVER=="", ACTION=="add", ATTR{initstate}=="0", ATTR{comp_algorithm}="lzo", ATTR{disksize}="1G",   RUN+="/sbin/mkfs.ext4 -q -O ^has_journal -L $name $env{DEVNAME}"
+EOF
+    chroot_ok "zram volatile directories configured (udev + fstab)."
+
     ok "All write-endurance optimizations applied."
 }
 
@@ -622,13 +643,13 @@ ROOT_OPTS=\$(findmnt -n -o OPTIONS /)
 [[ "\$ROOT_OPTS" == *noatime* ]]                      && r="pass" || r="fail"; check "noatime set" "\$r"
 [[ "\$ROOT_OPTS" == *lazytime* ]]                     && r="pass" || r="fail"; check "lazytime set" "\$r"
 
-# ── tmpfs ──────────────────────────────────────────────────────────────────
+# ── Volatile directories (zram-backed) ─────────────────────────────────────
 echo ""
-echo "Volatile directories (tmpfs):"
+echo "Volatile directories (zram):"
 for dir in /tmp /var/log /var/spool /var/cache /var/tmp; do
-    fs=\$(findmnt -n -o FSTYPE "\$dir" 2>/dev/null || echo "none")
-    [[ "\$fs" == "tmpfs" ]] && check "\$dir → tmpfs" "pass" \
-                            || check "\$dir → tmpfs (got: \$fs)" "fail"
+    src=\$(findmnt -n -o SOURCE "\$dir" 2>/dev/null || echo "none")
+    [[ "\$src" == /dev/zram* ]] && check "\$dir → zram" "pass" \
+                                || check "\$dir → zram (got: \$src)" "fail"
 done
 
 # ── Swap ───────────────────────────────────────────────────────────────────
