@@ -701,6 +701,38 @@ VERIFYEOF
 }
 
 # =============================================================================
+# Step 10: Final cleanup
+# =============================================================================
+final_cleanup() {
+    step 10 "Final cleanup and unmount"
+
+    run_in_chroot "
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+        rm -rf /var/cache/apt/archives/*.deb
+    "
+
+    cleanup_mounts
+    sync
+
+    ok "Installation complete!"
+    echo ""
+    echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║  USB drive is ready!                                          ║${NC}"
+    echo -e "${GREEN}║                                                               ║${NC}"
+    echo -e "${GREEN}║  Target  : $TARGET                                            ║${NC}"
+    echo -e "${GREEN}║  Login   : $DEFAULT_USER / $DEFAULT_PASS                      ║${NC}"
+    echo -e "${GREEN}║  Swap    : $(printf '%-44s' "$($ENABLE_SWAP && echo 'zram (zstd)' || echo 'DISABLED')")║${NC}"
+    echo -e "${GREEN}║                                                               ║${NC}"
+    echo -e "${GREEN}║  ⚠  CHANGE YOUR PASSWORD on first login!                     ║${NC}"
+    echo -e "${GREEN}║                                                               ║${NC}"
+    echo -e "${GREEN}║  After boot, verify with:                                     ║${NC}"
+    echo -e "${GREEN}║    sudo /usr/local/sbin/verify-usb-setup.sh                   ║${NC}"
+    echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
@@ -716,6 +748,7 @@ main() {
     chroot_configure_system
     apply_write_reduction
     install_verify_script
+    final_cleanup
 }
 
 main "$@"
