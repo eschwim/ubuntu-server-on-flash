@@ -232,6 +232,10 @@ prepare_chroot() {
     mount --bind /proc    "$MOUNTPOINT/proc"
     mount --bind /sys     "$MOUNTPOINT/sys"
     mount --bind /run     "$MOUNTPOINT/run"
+    # Remove the target's resolv.conf (often a symlink into /run on systemd-resolved
+    # hosts) before copying — after binding /run both paths resolve to the same
+    # physical file, which causes cp to error.
+    rm -f "$MOUNTPOINT/etc/resolv.conf"
     cp -L /etc/resolv.conf "$MOUNTPOINT/etc/resolv.conf"
 
     ok "Chroot bind mounts ready."
