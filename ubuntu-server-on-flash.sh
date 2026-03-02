@@ -372,11 +372,11 @@ UUID=${BOOT_UUID}   /boot       ext4    noatime  0  2
 UUID=${EFI_UUID}    /boot/efi   vfat    umask=0077  0  1
 
 # ── Volatile directories — zram (lzo) backed, formatted at boot via udev ──────
-/dev/zram0  /tmp        ext4  nosuid,nodev,noatime          0  0
-/dev/zram1  /var/tmp    ext4  nosuid,nodev,noatime          0  0
-/dev/zram2  /var/log    ext4  nosuid,nodev,noexec,noatime   0  0
-/dev/zram3  /var/spool  ext4  nosuid,nodev,noexec,noatime   0  0
-/dev/zram4  /var/cache  ext4  nosuid,nodev,noexec,noatime   0  0
+/dev/zram0  /tmp        ext4  nosuid,nodev,noatime,nofail          0  0
+/dev/zram1  /var/tmp    ext4  nosuid,nodev,noatime,nofail          0  0
+/dev/zram2  /var/log    ext4  nosuid,nodev,noexec,noatime,nofail   0  0
+/dev/zram3  /var/spool  ext4  nosuid,nodev,noexec,noatime,nofail   0  0
+/dev/zram4  /var/cache  ext4  nosuid,nodev,noexec,noatime,nofail   0  0
 EOF
     chroot_ok "fstab written."
 
