@@ -122,9 +122,12 @@ preflight() {
 
     # Safety confirmation
     echo ""
-    echo -e "${RED}╔════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║  WARNING: ALL DATA ON ${TARGET} WILL BE PERMANENTLY DESTROYED     ║${NC}"
-    echo -e "${RED}╚════════════════════════════════════════════════════════════════════╝${NC}"
+    local warn_msg="  WARNING: ALL DATA ON ${TARGET} WILL BE PERMANENTLY DESTROYED  "
+    local warn_bar
+    printf -v warn_bar '═%.0s' $(seq 1 ${#warn_msg})
+    echo -e "${RED}╔${warn_bar}╗${NC}"
+    echo -e "${RED}║${warn_msg}║${NC}"
+    echo -e "${RED}╚${warn_bar}╝${NC}"
     echo ""
     lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINT "$TARGET" 2>/dev/null || true
     echo ""
