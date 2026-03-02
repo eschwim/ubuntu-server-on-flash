@@ -13,6 +13,7 @@
 #   --user NAME       Default username (default: admin)
 #   --password PASS   Default password (default: changeme)
 #   --efi-size SIZE   EFI partition size (default: 512M)
+#   --boot-size SIZE  /boot partition size (default: 1G)
 #   --no-swap         Do not configure zram swap
 #   --help            Show this help
 # =============================================================================
@@ -23,6 +24,7 @@ RELEASE="noble"
 MIRROR="http://archive.ubuntu.com/ubuntu"
 MOUNTPOINT="/mnt/usb-target"
 EFI_SIZE="512M"
+BOOT_SIZE="1G"
 HOSTNAME_TARGET="usbserver"
 DEFAULT_USER="admin"
 DEFAULT_PASS="changeme"
@@ -31,6 +33,7 @@ ENABLE_SWAP=true
 # Partition device paths (set after parsing args)
 TARGET=""
 PART_EFI=""
+PART_BOOT=""
 PART_ROOT=""
 
 # ── Colors / logging ───────────────────────────────────────────────────────
@@ -64,6 +67,7 @@ parse_args() {
             --user)       DEFAULT_USER="$2";   shift 2 ;;
             --password)   DEFAULT_PASS="$2";   shift 2 ;;
             --efi-size)   EFI_SIZE="$2";       shift 2 ;;
+            --boot-size)  BOOT_SIZE="$2";      shift 2 ;;
             --no-swap)    ENABLE_SWAP=false;   shift   ;;
             --help|-h)    usage ;;
             -*)           die "Unknown option: $1 (see --help)" ;;
@@ -80,10 +84,12 @@ parse_args() {
     # Determine partition naming (nvme-style vs sd-style)
     if [[ "$TARGET" =~ [0-9]$ ]]; then
         PART_EFI="${TARGET}p1"
-        PART_ROOT="${TARGET}p2"
+        PART_BOOT="${TARGET}p2"
+        PART_ROOT="${TARGET}p3"
     else
         PART_EFI="${TARGET}1"
-        PART_ROOT="${TARGET}2"
+        PART_BOOT="${TARGET}2"
+        PART_ROOT="${TARGET}3"
     fi
 }
 
@@ -99,6 +105,7 @@ cleanup_mounts() {
         "$MOUNTPOINT/proc"
         "$MOUNTPOINT/sys"
         "$MOUNTPOINT/run"
+        "$MOUNTPOINT/boot"
         "$MOUNTPOINT"
     )
     for d in "${dirs[@]}"; do
@@ -157,7 +164,7 @@ preflight() {
 # Step 2: Partition the target drive
 # =============================================================================
 partition_drive() {
-    step 2 "Partitioning $TARGET (GPT: ${EFI_SIZE} EFI + F2FS root)"
+    step 2 "Partitioning $TARGET (GPT: ${EFI_SIZE} EFI + ${BOOT_SIZE} /boot + F2FS root)"
 
     # Unmount anything currently on the target
     for mp in $(findmnt -rn -o TARGET -S "${TARGET}"* 2>/dev/null || true); do
@@ -166,14 +173,16 @@ partition_drive() {
 
     wipefs -af "$TARGET"
     sgdisk --zap-all "$TARGET"
-    sgdisk -n "1:0:+${EFI_SIZE}" -t 1:ef00 -c 1:"EFI"    "$TARGET"
-    sgdisk -n 2:0:0              -t 2:8300 -c 2:"rootfs"  "$TARGET"
+    sgdisk -n "1:0:+${EFI_SIZE}"  -t 1:ef00 -c 1:"EFI"    "$TARGET"
+    sgdisk -n "2:0:+${BOOT_SIZE}" -t 2:8300 -c 2:"boot"   "$TARGET"
+    sgdisk -n 3:0:0               -t 3:8300 -c 3:"rootfs"  "$TARGET"
     partprobe "$TARGET"
     sleep 2
 
     [[ -b "$PART_EFI"  ]] || die "EFI partition $PART_EFI not found."
+    [[ -b "$PART_BOOT" ]] || die "Boot partition $PART_BOOT not found."
     [[ -b "$PART_ROOT" ]] || die "Root partition $PART_ROOT not found."
-    ok "Partitions created: EFI=$PART_EFI  Root=$PART_ROOT"
+    ok "Partitions created: EFI=$PART_EFI  Boot=$PART_BOOT  Root=$PART_ROOT"
 }
 
 # =============================================================================
@@ -184,6 +193,9 @@ create_filesystems() {
 
     info "Formatting EFI (FAT32)..."
     mkfs.vfat -F 32 -n EFI "$PART_EFI"
+
+    info "Formatting /boot (ext4, uncompressed — required for GRUB)..."
+    mkfs.ext4 -q -L boot "$PART_BOOT"
 
     info "Formatting root (F2FS with compression feature)..."
     mkfs.f2fs -f \
@@ -207,10 +219,13 @@ mount_target() {
     local F2FS_OPTS="compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,atgc,lazytime,noatime"
     mount -t f2fs -o "$F2FS_OPTS" "$PART_ROOT" "$MOUNTPOINT"
 
+    mkdir -p "$MOUNTPOINT/boot"
+    mount -t ext4 "$PART_BOOT" "$MOUNTPOINT/boot"
+
     mkdir -p "$MOUNTPOINT/boot/efi"
     mount -t vfat "$PART_EFI" "$MOUNTPOINT/boot/efi"
 
-    ok "Mounted — ALL writes from here on are compressed on disk."
+    ok "Mounted — root compressed, /boot on plain ext4 for GRUB compatibility."
 }
 
 # =============================================================================
@@ -337,17 +352,21 @@ EOF
     # ── fstab ───────────────────────────────────────────────────────────────
     chroot_info "Writing /etc/fstab..."
 
-    local ROOT_UUID EFI_UUID
+    local ROOT_UUID BOOT_UUID EFI_UUID
     ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    BOOT_UUID=$(blkid -s UUID -o value "$PART_BOOT")
     EFI_UUID=$(blkid -s UUID -o value "$PART_EFI")
 
     cat > "$MOUNTPOINT/etc/fstab" << EOF
 # =============================================================================
-# USB Flash Drive fstab — F2FS compressed root + zram volatile dirs
+# USB Flash Drive fstab — F2FS compressed root + ext4 /boot + zram volatile dirs
 # =============================================================================
 
 # Root: F2FS with zstd:6 compression on all files
 UUID=${ROOT_UUID}   /           f2fs    compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,atgc,lazytime,noatime  0  0
+
+# /boot: plain ext4 — GRUB reads kernel and grub.cfg from here (no F2FS needed)
+UUID=${BOOT_UUID}   /boot       ext4    noatime  0  2
 
 # EFI System Partition
 UUID=${EFI_UUID}    /boot/efi   vfat    umask=0077  0  1
