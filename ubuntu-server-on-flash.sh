@@ -137,7 +137,7 @@ preflight() {
     [[ "$CONFIRM" == "YES" ]] || die "Aborted by user."
 
     # Install host dependencies
-    local DEPS=(debootstrap f2fs-tools dosfstools gdisk)
+    local DEPS=(debootstrap f2fs-tools dosfstools gdisk parted)
     local MISSING=()
     for pkg in "${DEPS[@]}"; do
         dpkg -s "$pkg" &>/dev/null || MISSING+=("$pkg")
