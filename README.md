@@ -7,6 +7,8 @@ USB flash drive, optimized for flash storage longevity.
 
 - **F2FS root filesystem** with zstd:6 transparent compression — reduces writes
   and extends drive life while improving effective capacity
+- **Separate ext4 `/boot`** — GRUB reads the kernel and its config from a plain
+  ext4 partition, avoiding any dependency on F2FS support in the bootloader
 - **zram volatile directories** — `/tmp`, `/var/tmp`, `/var/log`, `/var/spool`,
   and `/var/cache` are backed by lzo-compressed zram block devices, keeping
   high-churn data entirely in RAM
@@ -21,7 +23,7 @@ USB flash drive, optimized for flash storage longevity.
 
 The host machine running the script must be running Ubuntu/Debian with internet
 access. Missing dependencies (`debootstrap`, `f2fs-tools`, `dosfstools`,
-`gdisk`) are installed automatically.
+`gdisk`, `parted`) are installed automatically.
 
 The target USB drive must be at least **8 GB**.
 
@@ -41,17 +43,26 @@ sudo ./ubuntu-server-on-flash.sh /dev/sdX [OPTIONS]
 | `--user NAME` | `admin` | Default username |
 | `--password PASS` | `changeme` | Default password |
 | `--efi-size SIZE` | `512M` | EFI partition size |
+| `--boot-size SIZE` | `1G` | `/boot` partition size |
 | `--no-swap` | *(swap enabled)* | Disable zram swap |
 
 > **Warning:** The target device will be completely wiped. The script prompts
 > for confirmation before making any changes.
 
+## Partition layout
+
+| # | Size | Filesystem | Mount |
+|---|---|---|---|
+| 1 | 512M (configurable) | FAT32 | `/boot/efi` |
+| 2 | 1G (configurable) | ext4 | `/boot` |
+| 3 | remainder | F2FS (zstd:6) | `/` |
+
 ## What the script does
 
 1. **Preflight** — verifies root, prompts for confirmation, installs host dependencies
-2. **Partition** — writes a GPT with a 512 M EFI partition and an F2FS root partition
-3. **Filesystems** — formats EFI as FAT32 and root as F2FS with compression features enabled
-4. **Mount** — mounts the root with `compress_algorithm=zstd:6,compress_extension=*`
+2. **Partition** — writes a GPT with EFI, ext4 `/boot`, and F2FS root partitions
+3. **Filesystems** — formats EFI as FAT32, `/boot` as ext4, and root as F2FS with compression features enabled
+4. **Mount** — mounts root with `compress_algorithm=zstd:6,compress_extension=*`, then mounts `/boot` and `/boot/efi`
 5. **Debootstrap** — installs the Ubuntu base system
 6. **Chroot configuration** — APT sources, kernel, GRUB, SSH, locale, user account, fstab, and networking via systemd-networkd
 7. **Write-endurance optimizations** — see below
