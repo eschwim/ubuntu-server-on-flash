@@ -427,6 +427,8 @@ EOF
     run_in_chroot "
         grep -qxF 'f2fs' /etc/initramfs-tools/modules 2>/dev/null || \
             echo 'f2fs' >> /etc/initramfs-tools/modules
+        grep -qxF 'zstd' /etc/initramfs-tools/modules 2>/dev/null || \
+            echo 'zstd' >> /etc/initramfs-tools/modules
         update-initramfs -u -k all
     "
     chroot_ok "initramfs updated."
