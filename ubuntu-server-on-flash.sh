@@ -29,6 +29,7 @@ HOSTNAME_TARGET="usbserver"
 DEFAULT_USER="admin"
 DEFAULT_PASS="changeme"
 ENABLE_SWAP=true
+GRUB_ONLY=false
 
 # Partition device paths (set after parsing args)
 TARGET=""
@@ -69,6 +70,7 @@ parse_args() {
             --efi-size)   EFI_SIZE="$2";       shift 2 ;;
             --boot-size)  BOOT_SIZE="$2";      shift 2 ;;
             --no-swap)    ENABLE_SWAP=false;   shift   ;;
+            --grub-only)  GRUB_ONLY=true;      shift   ;;
             --help|-h)    usage ;;
             -*)           die "Unknown option: $1 (see --help)" ;;
             *)
@@ -192,12 +194,15 @@ create_filesystems() {
     step 3 "Creating filesystems"
 
     info "Formatting EFI (FAT32)..."
+    wipefs -af "$PART_EFI"
     mkfs.vfat -F 32 -n EFI "$PART_EFI"
 
     info "Formatting /boot (ext4, uncompressed — required for GRUB)..."
+    wipefs -af "$PART_BOOT"
     mkfs.ext4 -q -L boot "$PART_BOOT"
 
     info "Formatting root (F2FS with compression feature)..."
+    wipefs -af "$PART_ROOT"
     mkfs.f2fs -f \
         -O extra_attr,inode_checksum,sb_checksum,compression \
         -C utf8 \
@@ -216,7 +221,7 @@ mount_target() {
     cleanup_mounts 2>/dev/null
     mkdir -p "$MOUNTPOINT"
 
-    local F2FS_OPTS="compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,atgc,lazytime,noatime"
+    local F2FS_OPTS="compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,lazytime,noatime"
     mount -t f2fs -o "$F2FS_OPTS" "$PART_ROOT" "$MOUNTPOINT"
 
     mkdir -p "$MOUNTPOINT/boot"
@@ -266,6 +271,90 @@ run_in_chroot() {
         export PATH=/usr/sbin:/usr/bin:/sbin:/bin
         $1
     "
+}
+
+# =============================================================================
+# GRUB installation (shared by full install and --grub-only mode)
+# =============================================================================
+install_grub() {
+    local ROOT_UUID BOOT_UUID
+    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    BOOT_UUID=$(blkid -s UUID -o value "$PART_BOOT")
+
+    chroot_info "Installing GRUB (UEFI, removable)..."
+    cat > "$MOUNTPOINT/etc/default/grub" << 'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_TIMEOUT_STYLE=menu
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX=""
+GRUB_TERMINAL=console
+GRUB_DISABLE_OS_PROBER=true
+EOF
+    run_in_chroot "
+        grub-install \
+            --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --removable \
+            --no-nvram
+        update-grub
+    "
+    chroot_ok "GRUB modules installed."
+
+    # update-grub in a chroot sees /proc/mounts from the host, so it doesn't
+    # detect /boot as a separate filesystem and generates paths that search for
+    # the F2FS root (which GRUB can't read). Overwrite with a known-good config
+    # that correctly targets the ext4 /boot partition by UUID.
+    chroot_info "Writing grub.cfg..."
+    cat > "$MOUNTPOINT/boot/grub/grub.cfg" << EOF
+set default=0
+set timeout=3
+
+insmod part_gpt
+insmod ext2
+search --no-floppy --fs-uuid --set=root ${BOOT_UUID}
+
+menuentry 'Ubuntu GNU/Linux' {
+    insmod gzio
+    insmod part_gpt
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root ${BOOT_UUID}
+    linux   /vmlinuz root=UUID=${ROOT_UUID} ro quiet
+    initrd  /initrd.img
+}
+
+menuentry 'Ubuntu GNU/Linux (recovery mode)' {
+    insmod gzio
+    insmod part_gpt
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root ${BOOT_UUID}
+    linux   /vmlinuz root=UUID=${ROOT_UUID} ro recovery nomodeset
+    initrd  /initrd.img
+}
+EOF
+    chroot_ok "grub.cfg written."
+
+    # grub-install embeds a prefix into the EFI binary at install time based on
+    # what it detects in the chroot — which is often wrong for removable drives
+    # because it sees the host's /proc/mounts. Replace BOOTX64.EFI with a
+    # grub-mkstandalone image that has the BOOT_UUID search baked directly into
+    # the binary. This is fully portable: no hardcoded disk numbers, no prefix
+    # path assumptions. The prefix stays pointing at the memdisk (which contains
+    # all modules), so no modules need to be loaded from disk.
+    chroot_info "Building standalone GRUB EFI binary (UUID search embedded)..."
+    cat > "$MOUNTPOINT/tmp/grub-embedded.cfg" << EOF
+search --no-floppy --fs-uuid --set=root ${BOOT_UUID}
+configfile (\$root)/grub/grub.cfg
+EOF
+    run_in_chroot "
+        grub-mkstandalone \
+            --format=x86_64-efi \
+            --modules='part_gpt part_msdos fat ext2 search search_fs_uuid configfile normal echo linux gzio' \
+            --output=/boot/efi/EFI/BOOT/BOOTX64.EFI \
+            boot/grub/grub.cfg=/tmp/grub-embedded.cfg
+    "
+    rm -f "$MOUNTPOINT/tmp/grub-embedded.cfg"
+    chroot_ok "Standalone GRUB EFI binary written to EFI/BOOT/BOOTX64.EFI."
 }
 
 # =============================================================================
@@ -363,7 +452,7 @@ EOF
 # =============================================================================
 
 # Root: F2FS with zstd:6 compression on all files
-UUID=${ROOT_UUID}   /           f2fs    compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,atgc,lazytime,noatime  0  0
+UUID=${ROOT_UUID}   /           f2fs    compress_algorithm=zstd:6,compress_extension=*,compress_chksum,gc_merge,lazytime,noatime  0  0
 
 # /boot: plain ext4 — GRUB reads kernel and grub.cfg from here (no F2FS needed)
 UUID=${BOOT_UUID}   /boot       ext4    noatime  0  2
@@ -401,26 +490,7 @@ EOF
     chroot_ok "Networking: DHCP on all wired interfaces."
 
     # ── GRUB ────────────────────────────────────────────────────────────────
-    chroot_info "Installing GRUB (UEFI, removable)..."
-    cat > "$MOUNTPOINT/etc/default/grub" << 'EOF'
-GRUB_DEFAULT=0
-GRUB_TIMEOUT=3
-GRUB_TIMEOUT_STYLE=menu
-GRUB_CMDLINE_LINUX_DEFAULT="quiet"
-GRUB_CMDLINE_LINUX=""
-GRUB_TERMINAL=console
-GRUB_DISABLE_OS_PROBER=true
-EOF
-    run_in_chroot "
-        grub-install \
-            --target=x86_64-efi \
-            --efi-directory=/boot/efi \
-            --bootloader-id=ubuntu \
-            --removable \
-            --no-nvram
-        update-grub
-    "
-    chroot_ok "GRUB installed (removable EFI — portable across UEFI machines)."
+    install_grub
 
     # ── initramfs ───────────────────────────────────────────────────────────
     chroot_info "Updating initramfs with F2FS support..."
@@ -648,11 +718,11 @@ PASS=0; FAIL=0; WARN=0
 check() {
     local desc="\$1" result="\$2"
     if [[ "\$result" == "pass" ]]; then
-        echo -e "  \${GREEN}✓\${NC} \$desc"; ((PASS++))
+        echo -e "  \${GREEN}✓\${NC} \$desc"; (( ++PASS ))
     elif [[ "\$result" == "warn" ]]; then
-        echo -e "  \${YELLOW}!\${NC} \$desc"; ((WARN++))
+        echo -e "  \${YELLOW}!\${NC} \$desc"; (( ++WARN ))
     else
-        echo -e "  \${RED}✗\${NC} \$desc"; ((FAIL++))
+        echo -e "  \${RED}✗\${NC} \$desc"; (( ++FAIL ))
     fi
 }
 
@@ -664,9 +734,10 @@ echo "════════════════════════�
 # ── Filesystem ─────────────────────────────────────────────────────────────
 echo ""
 echo "Filesystem:"
+ROOT_FSTYPE=\$(findmnt -n -o FSTYPE /)
 ROOT_OPTS=\$(findmnt -n -o OPTIONS /)
 
-[[ "\$ROOT_OPTS" == *f2fs* ]]                         && r="pass" || r="fail"; check "Root is F2FS" "\$r"
+[[ "\$ROOT_FSTYPE" == "f2fs" ]]                       && r="pass" || r="fail"; check "Root is F2FS" "\$r"
 [[ "\$ROOT_OPTS" == *compress_algorithm=zstd* ]]      && r="pass" || r="fail"; check "zstd compression active" "\$r"
 [[ "\$ROOT_OPTS" == *noatime* ]]                      && r="pass" || r="fail"; check "noatime set" "\$r"
 [[ "\$ROOT_OPTS" == *lazytime* ]]                     && r="pass" || r="fail"; check "lazytime set" "\$r"
@@ -726,7 +797,8 @@ fi
 echo ""
 echo "Masked services:"
 for svc in apt-daily.timer apt-daily-upgrade.timer fstrim.timer systemd-coredump.socket; do
-    STATE=\$(systemctl is-enabled "\$svc" 2>/dev/null || echo "not-found")
+    STATE=\$(systemctl is-enabled "\$svc" 2>/dev/null || true)
+    [[ -z "\$STATE" ]] && STATE="not-found"
     if [[ "\$STATE" == "masked" ]]; then
         check "\$svc" "pass"
     elif [[ "\$STATE" == "not-found" ]]; then
@@ -773,7 +845,7 @@ final_cleanup() {
     echo -e "${GREEN}$(printf '║%-63s║' "  Login   : $DEFAULT_USER / $DEFAULT_PASS")${NC}"
     echo -e "${GREEN}$(printf '║%-63s║' "  Swap    : $($ENABLE_SWAP && echo 'zram (zstd)' || echo 'DISABLED')")${NC}"
     echo -e "${GREEN}║                                                               ║${NC}"
-    echo -e "${GREEN}║  ⚠  CHANGE YOUR PASSWORD on first login!                     ║${NC}"
+    echo -e "${GREEN}║  ⚠  CHANGE YOUR PASSWORD on first login!                      ║${NC}"
     echo -e "${GREEN}║                                                               ║${NC}"
     echo -e "${GREEN}║  After boot, verify with:                                     ║${NC}"
     echo -e "${GREEN}║    sudo /usr/local/sbin/verify-usb-setup.sh                   ║${NC}"
@@ -787,6 +859,18 @@ final_cleanup() {
 main() {
     parse_args "$@"
     trap 'on_error $LINENO' ERR
+
+    if $GRUB_ONLY; then
+        [[ $EUID -eq 0 ]] || die "This script must be run as root."
+        info "GRUB-only mode: reinstalling GRUB on existing $TARGET installation"
+        mount_target
+        prepare_chroot
+        install_grub
+        cleanup_mounts
+        sync
+        ok "GRUB reinstalled on $TARGET"
+        return
+    fi
 
     preflight
     partition_drive
